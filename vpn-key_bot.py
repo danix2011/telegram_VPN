@@ -2,6 +2,7 @@ import logging
 import sqlite3
 from io import BytesIO
 import secrets
+from telegram import Update
 import asyncio
 from datetime import datetime, timedelta, timezone, time
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, ReplyKeyboardMarkup
@@ -17,7 +18,7 @@ from apscheduler.schedulers.asyncio import AsyncIOScheduler
 
 # Конфигурация
 TOKEN = "7749755571:AAE4qmU7G04BpVzddPMjkzN3dAO9tj7qqrU"
-ADMIN_IDS = [2134434120]
+ADMIN_IDS = [2134434120, 6639580282]
 VPN_DNS = "1.1.1.1, 8.8.8.8"
 KEY_EXPIRATION_DAYS = 30
 WG_SERVER = {
@@ -106,64 +107,33 @@ async def generate_config(update: Update, context: ContextTypes.DEFAULT_TYPE, vp
             await update.callback_query.message.reply_text("❌ Сначала получите ключ через /getkey")
             return
 
-        vpn_key = result[0]
-        config = ""
-        filename = ""
+        user_key = result[0]
+        server_public_key = "ВАШ_ПУБЛИЧНЫЙ_КЛЮЧ_СЕРВЕРА"
+        server_ip = "ВАШ_IP_СЕРВЕРА"
         
-        if vpn_type == "WireGuard":
-            # Генерация конфига WireGuard
-            config = f"""[Interface]
-
-PrivateKey = {vpn_key}
+        # Генерация конфига WireGuard для v2RayTun
+        config = f"""[Interface]
+PrivateKey = {user_key}
 Address = 10.0.0.{user_id % 254}/24
-DNS = {WG_SERVER['dns']}
+DNS = 1.1.1.1
 
 [Peer]
-PublicKey = {WG_SERVER['public_key']}
-Endpoint = {WG_SERVER['endpoint']}
-AllowedIPs = {WG_SERVER['allowed_ips']}"""
-            filename = f"wg-{user_id}.conf"
-            
-        elif vpn_type == "OpenVPN":
-            # Генерация конфига OpenVPN (пример)
-            config = f"""client
-dev tun
-proto {OVPN_SERVER['proto']}
-remote {OVPN_SERVER['host']} {OVPN_SERVER['port']}
-resolv-retry infinite
-nobind
-persist-key
-persist-tun
-<ca>
------BEGIN CERTIFICATE-----
-(вставьте CA сертификат)
------END CERTIFICATE-----
-</ca>
-<cert>
------BEGIN CERTIFICATE-----
-(вставьте клиентский сертификат)
------END CERTIFICATE-----
-</cert>
-<key>
------BEGIN PRIVATE KEY-----
-{vpn_key}
------END PRIVATE KEY-----
-</key>"""
-            filename = f"ovpn-{user_id}.ovpn"
+PublicKey = {server_public_key}
+Endpoint = {server_ip}:51820
+AllowedIPs = 0.0.0.0/0"""
         
         # Отправка файла
         bio = BytesIO(config.encode())
-        bio.name = filename
+        bio.name = f"v2raytun-wg-{user_id}.conf"
         await context.bot.send_document(
             chat_id=user_id,
             document=bio,
-            caption=f"⚙️ {vpn_type} конфигурация для вашего ключа"
+            caption="⚙️ Конфигурация для v2RayTun (WireGuard)"
         )
         
     except Exception as e:
-        logging.error(f"Ошибка генерации конфига: {e}")
-        await update.callback_query.message.reply_text("⚠️ Ошибка генерации конфигурации")
-        
+        logging.error(f"Ошибка: {e}")
+        await update.callback_query.message.reply_text("⚠️ Ошибка генерации конфига")
     finally:
         conn.close()
 
