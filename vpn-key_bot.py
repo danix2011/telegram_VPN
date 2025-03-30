@@ -407,7 +407,7 @@ async def successful_payment(update: Update, context: ContextTypes.DEFAULT_TYPE)
 
 def main():
     # Инициализация Application
-    application = Application.builder().token(TOKEN).build()
+    application = Application.builder().token('TOKEN').build()
 
     # Планировщик задач
     scheduler = AsyncIOScheduler(timezone="UTC")
