@@ -1,11 +1,11 @@
 import logging
 import sqlite3
 import secrets
+import asyncio
 from datetime import datetime, timedelta, timezone
 from io import BytesIO
-import pytz
-from apscheduler.triggers.interval import IntervalTrigger
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
+from apscheduler.triggers.interval import IntervalTrigger
 
 from telegram import (
     Update,
@@ -15,6 +15,7 @@ from telegram import (
     ReplyKeyboardMarkup
 )
 from telegram.ext import (
+    _updater,
     Application,
     CommandHandler,
     ContextTypes,
@@ -26,37 +27,34 @@ from telegram.ext import (
 
 # Конфигурация
 TOKEN = "7749755571:AAE4qmU7G04BpVzddPMjkzN3dAO9tj7qqrU"
-ADMIN_IDS = [2134434120, 6639580282]  # Ваш Telegram ID
+ADMIN_IDS = [2134434120, 6639580282]
 VPN_DNS = "1.1.1.1, 8.8.8.8"
 KEY_EXPIRATION_DAYS = 30
-WG_SERVER_PUBLIC_KEY = ""  # Публичный ключ сервера WireGuard
-SERVER_IP = ""  # IP-адрес сервера
-SUBSCRIPTION_PRICE = 20000  # 200 рублей в копейках
-STARS_PER_SUBSCRIPTION = 50  
+WG_SERVER_PUBLIC_KEY = "your_wg_pubkey"
+SERVER_IP = "your.server.ip"
+SUBSCRIPTION_PRICE = 20000
+STARS_PER_SUBSCRIPTION = 50
 REFERRAL_BONUS_DAYS = 7
 MAX_DEVICES = 3
 
-
-# Логирование
+# Настройка логирования
 logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s"
+    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
+    level=logging.INFO
 )
+logger = logging.getLogger(__name__)
 
 # Инициализация БД
 def init_db():
-    conn = sqlite3.connect('vpn_keys.db')
-    cursor = conn.cursor()
-    cursor.execute('''
-        CREATE TABLE IF NOT EXISTS users (
-            user_id INTEGER PRIMARY KEY,
-            key TEXT NOT NULL,
-            created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
-            expires_at TEXT
-        )
-    ''')
-    conn.commit()
-    conn.close()
+    with sqlite3.connect('vpn_keys.db') as conn:
+        conn.execute('''
+            CREATE TABLE IF NOT EXISTS users (
+                user_id INTEGER PRIMARY KEY,
+                key TEXT NOT NULL,
+                created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+                expires_at TEXT
+            )
+        ''')
 
 init_db()
 
@@ -78,68 +76,47 @@ admin_keyboard = ReplyKeyboardMarkup(
 
 # ================= ОСНОВНЫЕ ОБРАБОТЧИКИ =================
 
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user = update.effective_user
-    text = (
-        f"🔑 Добро пожаловать, {user.first_name}!\n"
-        "Выберите действие:\n"
-        "• /getkey - Получить VPN-ключ\n"
-        "• /dns - Рекомендуемые DNS\n"
-        "• /support - Техподдержка"
-    )
-    
-    if user.id in ADMIN_IDS:
-        await update.message.reply_text("👑 Режим администратора", reply_markup=admin_keyboard)
-    
-    await update.message.reply_text(text, reply_markup=user_keyboard)
-
 async def getkey(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
-    conn = sqlite3.connect('vpn_keys.db')
-    
     try:
-        cursor = conn.cursor()
-        cursor.execute('SELECT key, expires_at FROM users WHERE user_id = ?', (user_id,))
-        result = cursor.fetchone()
+        with sqlite3.connect('vpn_keys.db') as conn:
+            cursor = conn.cursor()
+            cursor.execute('SELECT key, expires_at FROM users WHERE user_id = ?', (user_id,))
+            result = cursor.fetchone()
 
-        if result and result[1]:
-            expires_at = datetime.fromisoformat(result[1])
-            if datetime.now(timezone.utc) < expires_at:
-                await update.message.reply_text(
-                    f"✅ Ваш ключ: {result[0]}\n"
-                    f"⏳ Действует до: {expires_at.strftime('%d.%m.%Y %H:%M')}"
-                )
-                return
+            if result and result[1]:
+                expires_at = datetime.fromisoformat(result[1])
+                if datetime.now(timezone.utc) < expires_at:
+                    await update.message.reply_text(
+                        f"✅ Ваш ключ: {result[0]}\n"
+                        f"⏳ Действует до: {expires_at.strftime('%d.%m.%Y %H:%M')}"
+                    )
+                    return
 
-        new_key = generate_key()
-        expires_at = datetime.now(timezone.utc) + timedelta(days=KEY_EXPIRATION_DAYS)
-        expires_str = expires_at.isoformat()
+            new_key = generate_key()
+            expires_at = datetime.now(timezone.utc) + timedelta(days=KEY_EXPIRATION_DAYS)
+            cursor.execute('''
+                INSERT OR REPLACE INTO users 
+                (user_id, key, expires_at)
+                VALUES (?, ?, ?)
+            ''', (user_id, new_key, expires_at.isoformat()))
+            conn.commit()
 
-        cursor.execute('''
-            INSERT OR REPLACE INTO users 
-            (user_id, key, expires_at)
-            VALUES (?, ?, ?)
-        ''', (user_id, new_key, expires_str))
-        conn.commit()
+            keyboard = InlineKeyboardMarkup([
+                [InlineKeyboardButton("WireGuard Config", callback_data="wg_config")],
+                [InlineKeyboardButton("OpenVPN Config", callback_data="ovpn_config")]
+            ])
 
-        keyboard = InlineKeyboardMarkup([
-            [InlineKeyboardButton("WireGuard Config", callback_data="wg_config")],
-            [InlineKeyboardButton("OpenVPN Config", callback_data="ovpn_config")]
-        ])
-
-        await update.message.reply_text(
-            f"🎉 Новый ключ: `{new_key}`\n"
-            f"⏳ Срок действия: {expires_at.strftime('%d.%m.%Y %H:%M')}\n\n"
-            "📎 Выберите тип конфигурации:",
-            reply_markup=keyboard,
-            parse_mode='Markdown'
-        )
-
+            await update.message.reply_text(
+                f"🎉 Новый ключ: `{new_key}`\n"
+                f"⏳ Срок действия: {expires_at.strftime('%d.%m.%Y %H:%M')}\n\n"
+                "📎 Выберите тип конфигурации:",
+                reply_markup=keyboard,
+                parse_mode='Markdown'
+            )
     except Exception as e:
-        logging.error(f"Ошибка: {e}")
+        logger.error(f"Error in getkey: {e}")
         await update.message.reply_text("🚫 Ошибка генерации ключа")
-    finally:
-        conn.close()
 
 # ================= ДОПОЛНИТЕЛЬНЫЕ ФУНКЦИИ =================
 
@@ -205,25 +182,24 @@ async def allkeys(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def generate_config(update: Update, context: ContextTypes.DEFAULT_TYPE, vpn_type: str):
     query = update.callback_query
     await query.answer()
-    
-    user_id = update.effective_user.id
-    conn = sqlite3.connect('vpn_keys.db')
+    user_id = query.from_user.id
     
     try:
-        cursor = conn.cursor()
-        cursor.execute('SELECT key FROM users WHERE user_id = ?', (user_id,))
-        result = cursor.fetchone()
-        
-        if not result:
-            await query.message.reply_text("❌ Сначала получите ключ через /getkey")
-            return
+        with sqlite3.connect('vpn_keys.db') as conn:
+            cursor = conn.cursor()
+            cursor.execute('SELECT key FROM users WHERE user_id = ?', (user_id,))
+            result = cursor.fetchone()
+            
+            if not result:
+                await query.message.reply_text("❌ Сначала получите ключ через /getkey")
+                return
 
-        key = result[0]
-        config = ""
-        filename = ""
-        
-        if vpn_type == "WireGuard":
-            config = f"""[Interface]
+            key = result[0]
+            config = ""
+            filename = ""
+            
+            if vpn_type == "WireGuard":
+                config = f"""[Interface]
 PrivateKey = {key}
 Address = 10.0.0.{user_id % 254}/24
 DNS = 1.1.1.1
@@ -232,10 +208,10 @@ DNS = 1.1.1.1
 PublicKey = {WG_SERVER_PUBLIC_KEY}
 Endpoint = {SERVER_IP}:51820
 AllowedIPs = 0.0.0.0/0"""
-            filename = f"wg-{user_id}.conf"
-            
-        elif vpn_type == "OpenVPN":
-            config = f"""client
+                filename = f"wg-{user_id}.conf"
+                
+            elif vpn_type == "OpenVPN":
+                config = f"""client
 dev tun
 proto udp
 remote {SERVER_IP} 1194
@@ -251,28 +227,34 @@ persist-tun
 <key>
 {key}
 </key>"""
-            filename = f"ovpn-{user_id}.ovpn"
+                filename = f"ovpn-{user_id}.ovpn"
 
-        bio = BytesIO(config.encode())
-        bio.name = filename
-        await context.bot.send_document(
-            chat_id=user_id,
-            document=bio,
-            caption=f"⚙️ {vpn_type} конфигурация"
-        )
-        
+            bio = BytesIO(config.encode())
+            bio.name = filename
+            await context.bot.send_document(
+                chat_id=user_id,
+                document=bio,
+                caption=f"⚙️ {vpn_type} конфигурация"
+            )
     except Exception as e:
-        logging.error(f"Ошибка: {e}")
+        logger.error(f"Config generation error: {e}")
         await query.message.reply_text("⚠️ Ошибка генерации конфига")
-    finally:
-        conn.close()
 
-async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    if query.data == "wg_config":
-        await generate_config(update, context, "WireGuard")
-    elif query.data == "ovpn_config":
-        await generate_config(update, context, "OpenVPN")
+async def check_subscriptions(app: Application):
+    """Ежедневная проверка подписок"""
+    try:
+        with sqlite3.connect('vpn_keys.db') as conn:
+            cursor = conn.cursor()
+            cursor.execute("SELECT user_id FROM users WHERE expires_at < ?", 
+                         (datetime.now(timezone.utc).isoformat(),))
+            
+            for user_id, in cursor.fetchall():
+                await app.bot.send_message(
+                    user_id,
+                    "⚠️ Ваша подписка истекает через 3 дня! Продлите её командой /buy"
+                )
+    except Exception as e:
+        logger.error(f"Subscription check error: {e}")
 
 # ================= НОВЫЕ ФУНКЦИИ ================= #
 
@@ -405,16 +387,30 @@ async def successful_payment(update: Update, context: ContextTypes.DEFAULT_TYPE)
 
 # ================= ЗАПУСК БОТА ================= #
 
-def main():
-    # Инициализация Application
-    application = Application.builder().token('TOKEN').build()
+async def check_subscriptions(app: Application):
+    """Ежедневная проверка подписок"""
+    try:
+        with sqlite3.connect('vpn_keys.db') as conn:
+            cursor = conn.cursor()
+            cursor.execute("SELECT user_id FROM users WHERE expires_at < ?", 
+                         (datetime.now(timezone.utc).isoformat(),))
+            
+            for user_id, in cursor.fetchall():
+                await app.bot.send_message(
+                    user_id,
+                    "⚠️ Ваша подписка истекает через 3 дня! Продлите её командой /buy"
+                )
+    except Exception as e:
+        logger.error(f"Subscription check error: {e}")
+
+async def main() -> None:
+    application = Application.builder().token(TOKEN).build()
 
     # Планировщик задач
-    scheduler = AsyncIOScheduler(timezone="UTC")
+    scheduler = AsyncIOScheduler()
     scheduler.add_job(
         check_subscriptions,
-        'interval',
-        hours=24,
+        IntervalTrigger(days=1),
         args=[application]
     )
     scheduler.start()
@@ -434,36 +430,15 @@ def main():
         CommandHandler("servers", server_selection),
         CallbackQueryHandler(button_handler),
         CallbackQueryHandler(handle_payment_choice, pattern=r"^(pay_card|pay_stars)$"),
+        PreCheckoutQueryHandler(precheckout),
+        MessageHandler(filters.SUCCESSFUL_PAYMENT, successful_payment),
         MessageHandler(filters.TEXT & ~filters.COMMAND, start)
     ]
-    
-    application.add_handler(PreCheckoutQueryHandler(precheckout))
-    application.add_handler(MessageHandler(filters.SUCCESSFUL_PAYMENT, successful_payment))
 
     for handler in handlers:
         application.add_handler(handler)
 
-    application.add_handler(CommandHandler("buy", buy))
-    application.add_handler(CallbackQueryHandler(handle_payment_choice, pattern=r"^(pay_card|pay_stars)$"))
+    await application.run_polling()
 
-    # Запуск бота
-    application.run_polling()
-
-async def check_subscriptions(context: ContextTypes.DEFAULT_TYPE):
-    """Ежедневная проверка подписок"""
-    conn = sqlite3.connect('vpn_keys.db')
-    cursor = conn.cursor()
-    cursor.execute("SELECT user_id FROM users WHERE expires_at < ?", 
-                 (datetime.now(timezone.utc).isoformat(),))
-    
-    for user_id, in cursor.fetchall():
-        await context.bot.send_message(
-            user_id,
-            "⚠️ Ваша подписка истекает через 3 дня! Продлите её командой /buy"
-        )
-    
-    conn.close()
-    
-    
 if __name__ == "__main__":
-    main()
+    asyncio.run(main())
