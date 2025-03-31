@@ -1,29 +1,16 @@
 import logging
 import sqlite3
 import secrets
-import asyncio
 from datetime import datetime, timedelta, timezone
 from io import BytesIO
+from aiogram import Bot, Dispatcher, types, F
+from aiogram.filters import Command
+from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton, ReplyKeyboardMarkup, Message, LabeledPrice, PreCheckoutQuery
+from aiogram.fsm.storage.memory import MemoryStorage
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
+from aiogram.utils.keyboard import InlineKeyboardBuilder
 from apscheduler.triggers.interval import IntervalTrigger
-
-from telegram import (
-    Update,
-    InlineKeyboardButton,
-    InlineKeyboardMarkup,
-    LabeledPrice,
-    ReplyKeyboardMarkup
-)
-from telegram.ext import (
-    _updater,
-    Application,
-    CommandHandler,
-    ContextTypes,
-    MessageHandler,
-    CallbackQueryHandler,
-    PreCheckoutQueryHandler,
-    filters
-)
+import asyncio
 
 # Конфигурация
 TOKEN = "7749755571:AAE4qmU7G04BpVzddPMjkzN3dAO9tj7qqrU"
@@ -32,10 +19,16 @@ VPN_DNS = "1.1.1.1, 8.8.8.8"
 KEY_EXPIRATION_DAYS = 30
 WG_SERVER_PUBLIC_KEY = "your_wg_pubkey"
 SERVER_IP = "your.server.ip"
-SUBSCRIPTION_PRICE = 20000
 STARS_PER_SUBSCRIPTION = 50
+SUBSCRIPTION_PRICE = 20000
 REFERRAL_BONUS_DAYS = 7
 MAX_DEVICES = 3
+
+# Инициализация бота
+bot = Bot(token=TOKEN)
+storage = MemoryStorage()
+dp = Dispatcher(storage=storage)
+scheduler = AsyncIOScheduler()
 
 # Настройка логирования
 logging.basicConfig(
@@ -47,13 +40,24 @@ logger = logging.getLogger(__name__)
 # Инициализация БД
 def init_db():
     with sqlite3.connect('vpn_keys.db') as conn:
-        conn.execute('''
+        conn.executescript('''
             CREATE TABLE IF NOT EXISTS users (
                 user_id INTEGER PRIMARY KEY,
                 key TEXT NOT NULL,
                 created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
                 expires_at TEXT
-            )
+            );
+            CREATE TABLE IF NOT EXISTS devices (
+                id INTEGER PRIMARY KEY,
+                user_id INTEGER,
+                device_info TEXT,
+                created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+            );
+            CREATE TABLE IF NOT EXISTS referrals (
+                id INTEGER PRIMARY KEY,
+                referrer_id INTEGER,
+                referral_id INTEGER UNIQUE
+            );
         ''')
 
 init_db()
@@ -63,21 +67,43 @@ def generate_key():
     return secrets.token_urlsafe(24)
 
 # Клавиатуры
-user_keyboard = ReplyKeyboardMarkup([
-    ["/getkey", "/dns", "/buy"],
-    ["/support", "/myid", "/ref"],
-    ["/devices", "/servers"]
-], resize_keyboard=True)
+def user_keyboard():
+    markup = ReplyKeyboardMarkup(resize_keyboard=True)
+    markup.row("/getkey", "/dns", "/buy")
+    markup.row("/support", "/myid", "/ref")
+    markup.row("/devices", "/servers")
+    return markup
 
-admin_keyboard = ReplyKeyboardMarkup(
-    [["/stats", "/allkeys"], ["/broadcast"]],
-    resize_keyboard=True
-)
+def admin_keyboard():
+    markup = ReplyKeyboardMarkup(resize_keyboard=True)
+    markup.row("/stats", "/allkeys")
+    markup.row("/broadcast")
+    return markup
 
 # ================= ОСНОВНЫЕ ОБРАБОТЧИКИ =================
+@dp.message(Command("start"))
+async def start(message: types.Message):
+    if len(message.text.split()) > 1:
+        ref_code = message.text.split()[1]
+        if ref_code.startswith('ref'):
+            await process_referral(int(ref_code[3:]), message.from_user.id)
 
-async def getkey(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.effective_user.id
+    text = (
+        f"🔑 Добро пожаловать, {message.from_user.first_name}!\n"
+        "Выберите действие:\n"
+        "• /getkey - Получить VPN-ключ\n"
+        "• /dns - Рекомендуемые DNS\n"
+        "• /support - Техподдержка"
+    )
+    
+    if message.from_user.id in ADMIN_IDS:
+        await message.answer("👑 Режим администратора")
+    
+    await message.answer(text)
+
+@dp.message(Command("getkey"))
+async def getkey(message: types.Message):
+    user_id = message.from_user.id
     try:
         with sqlite3.connect('vpn_keys.db') as conn:
             cursor = conn.cursor()
@@ -87,7 +113,7 @@ async def getkey(update: Update, context: ContextTypes.DEFAULT_TYPE):
             if result and result[1]:
                 expires_at = datetime.fromisoformat(result[1])
                 if datetime.now(timezone.utc) < expires_at:
-                    await update.message.reply_text(
+                    await message.answer(
                         f"✅ Ваш ключ: {result[0]}\n"
                         f"⏳ Действует до: {expires_at.strftime('%d.%m.%Y %H:%M')}"
                     )
@@ -102,88 +128,88 @@ async def getkey(update: Update, context: ContextTypes.DEFAULT_TYPE):
             ''', (user_id, new_key, expires_at.isoformat()))
             conn.commit()
 
-            keyboard = InlineKeyboardMarkup([
-                [InlineKeyboardButton("WireGuard Config", callback_data="wg_config")],
-                [InlineKeyboardButton("OpenVPN Config", callback_data="ovpn_config")]
-            ])
+            builder = InlineKeyboardBuilder()
+            builder.button(text="WireGuard Config", callback_data="wg_config")
+            builder.button(text="OpenVPN Config", callback_data="ovpn_config")
 
-            await update.message.reply_text(
+            await message.answer(
                 f"🎉 Новый ключ: `{new_key}`\n"
                 f"⏳ Срок действия: {expires_at.strftime('%d.%m.%Y %H:%M')}\n\n"
                 "📎 Выберите тип конфигурации:",
-                reply_markup=keyboard,
-                parse_mode='Markdown'
+                reply_markup=builder.as_markup(),
+                parse_mode="Markdown"
             )
     except Exception as e:
-        logger.error(f"Error in getkey: {e}")
-        await update.message.reply_text("🚫 Ошибка генерации ключа")
+        logging.error(f"Error in getkey: {e}")
+        await message.answer("🚫 Ошибка генерации ключа")
 
 # ================= ДОПОЛНИТЕЛЬНЫЕ ФУНКЦИИ =================
-
-async def dns(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text(
+@dp.message(Command("dns"))
+async def dns(message: types.Message):
+    await message.answer(
         f"🔧 Рекомендуемые DNS-серверы:\n\n"
         f"• Cloudflare: `1.1.1.1`\n"
         f"• Google: `8.8.8.8`\n"
         f"• AdGuard: `94.140.14.14`",
-        parse_mode='Markdown'
+        parse_mode="Markdown"
     )
 
-async def support(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text(
+@dp.message(Command("support"))
+async def support(message: types.Message):
+    await message.answer(
         "🛠 Техническая поддержка:\n\n"
         "• Email: support@example.com\n"
         "• Telegram: @tech_support"
     )
 
-async def myid(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user = update.effective_user
-    await update.message.reply_text(
-        f"🆔 Ваш Telegram ID: `{user.id}`",
+@dp.message(Command("myid"))
+async def myid(message: types.Message):
+    await message.answer(
+        f"🆔 Ваш Telegram ID: `{message.from_user.id}`",
         parse_mode='Markdown'
     )
 
 # ================= АДМИН-ФУНКЦИИ =================
-
-async def stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.effective_user.id not in ADMIN_IDS:
+@dp.message(Command("stats"))
+async def stats(message: types.Message):
+    if message.from_user.id not in ADMIN_IDS:
         return
     
-    conn = sqlite3.connect('vpn_keys.db')
-    cursor = conn.cursor()
-    cursor.execute('SELECT COUNT(*) FROM users')
-    total = cursor.fetchone()[0]
-    conn.close()
+    with sqlite3.connect('vpn_keys.db') as conn:
+        cursor = conn.cursor()
+        cursor.execute('SELECT COUNT(*) FROM users')
+        total = cursor.fetchone()[0]
     
-    await update.message.reply_text(
+    await message.answer(
         f"📊 Статистика:\n"
         f"• Всего пользователей: {total}\n"
         f"• Срок действия ключа: {KEY_EXPIRATION_DAYS} дней"
     )
-
-async def allkeys(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.effective_user.id not in ADMIN_IDS:
+@dp.message(Command("allkeys"))
+async def allkeys(message: types.Message):
+    if message.from_user.id not in ADMIN_IDS:
         return
     
-    conn = sqlite3.connect('vpn_keys.db')
-    cursor = conn.cursor()
-    cursor.execute('SELECT user_id, key, expires_at FROM users')
-    keys = cursor.fetchall()
-    conn.close()
+    with sqlite3.connect('vpn_keys.db') as conn:
+        cursor = conn.cursor()
+        cursor.execute('SELECT user_id, key, expires_at FROM users')
+        keys = cursor.fetchall()
     
     response = "🔑 Все активные ключи:\n\n"
     for user_id, key, expires_at in keys:
         response += f"👤 {user_id}: `{key}`\n⏳ {expires_at}\n\n"
     
-    await update.message.reply_text(response[:4000], parse_mode='Markdown')
+    await message.answer(response[:4000], parse_mode="Markdown")
 
 # ================= КОНФИГУРАЦИИ VPN =================
+@dp.callback_query(lambda c: c.data in ("wg_config", "ovpn_config"))
+async def button_handler(callback_query: types.CallbackQuery):
+    vpn_type = "WireGuard" if callback_query.data == 'wg_config' else "OpenVPN"
+    await generate_config(callback_query, vpn_type)
+    await bot.answer_callback_query(callback_query.id)
 
-async def generate_config(update: Update, context: ContextTypes.DEFAULT_TYPE, vpn_type: str):
-    query = update.callback_query
-    await query.answer()
-    user_id = query.from_user.id
-    
+async def generate_config(callback_query: types.CallbackQuery, vpn_type: str):
+    user_id = callback_query.from_user.id
     try:
         with sqlite3.connect('vpn_keys.db') as conn:
             cursor = conn.cursor()
@@ -191,7 +217,7 @@ async def generate_config(update: Update, context: ContextTypes.DEFAULT_TYPE, vp
             result = cursor.fetchone()
             
             if not result:
-                await query.message.reply_text("❌ Сначала получите ключ через /getkey")
+                await bot.send_message(user_id, "❌ Сначала получите ключ через /getkey")
                 return
 
             key = result[0]
@@ -231,214 +257,148 @@ persist-tun
 
             bio = BytesIO(config.encode())
             bio.name = filename
-            await context.bot.send_document(
+            await bot.send_document(
                 chat_id=user_id,
                 document=bio,
                 caption=f"⚙️ {vpn_type} конфигурация"
             )
     except Exception as e:
         logger.error(f"Config generation error: {e}")
-        await query.message.reply_text("⚠️ Ошибка генерации конфига")
+        await bot.send_message(user_id, "⚠️ Ошибка генерации конфига")
 
-async def check_subscriptions(app: Application):
-    """Ежедневная проверка подписок"""
-    try:
-        with sqlite3.connect('vpn_keys.db') as conn:
-            cursor = conn.cursor()
-            cursor.execute("SELECT user_id FROM users WHERE expires_at < ?", 
-                         (datetime.now(timezone.utc).isoformat(),))
-            
-            for user_id, in cursor.fetchall():
-                await app.bot.send_message(
-                    user_id,
-                    "⚠️ Ваша подписка истекает через 3 дня! Продлите её командой /buy"
-                )
-    except Exception as e:
-        logger.error(f"Subscription check error: {e}")
+# ================= ПЛАТЕЖНАЯ СИСТЕМА =================
+@dp.message(Command("buy"))
+async def buy(message: types.Message):
+    builder = InlineKeyboardBuilder()
+    builder.button(text="💳 Картой", callback_data="pay_card")
+    builder.button(text="⭐️ Stars", callback_data="pay_stars")
+    await message.answer(
+        "🎁 Выберите способ оплаты:",
+        reply_markup=builder.as_markup()
+    )
+@dp.callback_query(F.data.startswith("pay_"))
+async def handle_payment_choice(callback: types.CallbackQuery):
+    payment_type = callback.data.split("_")[1]
+    if payment_type == "card":
+        await send_card_invoice(callback)
+    elif payment_type == "stars":
+        await send_stars_invoice(callback)
+    await callback.answer()
 
-# ================= НОВЫЕ ФУНКЦИИ ================= #
-
-async def buy_subscription(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Оплата подписки через ЮKassa"""
-    chat_id = update.message.chat_id
-    title = "VPN Premium подписка"
-    description = "Доступ к VPN на 1 месяц"
-    payload = "subscription"
-    currency = "RUB"
-    prices = [LabeledPrice("Месячная подписка", SUBSCRIPTION_PRICE)]
-
-    await context.bot.send_invoice(
-        chat_id,
-        title,
-        description,
-        payload,
-        "YOUR_PAYMENT_TOKEN",
-        currency,
-        prices
+async def send_card_invoice(callback: types.CallbackQuery):
+    await bot.send_invoice(
+        chat_id=callback.from_user.id,
+        title="VPN Premium Подписка",
+        description="Доступ к VPN на 1 месяц",
+        payload="card_payment",
+        provider_token="YOUR_PAYMENT_TOKEN",
+        currency="RUB",
+        prices=[LabeledPrice(label="Подписка", amount=SUBSCRIPTION_PRICE)]
     )
 
-async def referral_system(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Реферальная система"""
-    user_id = update.effective_user.id
-    ref_link = f"https://t.me/{context.bot.username}?start=ref{user_id}"
-    
-    await update.message.reply_text(
+async def send_stars_invoice(callback: types.CallbackQuery):
+    await bot.send_invoice(
+        chat_id=callback.from_user.id,
+        title="VPN Premium (Stars)",
+        description="Доступ к VPN на 1 месяц",
+        payload="stars_payment",
+        provider_token="YOUR_STARS_TOKEN",
+        currency="XTR",
+        prices=[LabeledPrice(label="Подписка", amount=STARS_PER_SUBSCRIPTION*100)]
+    )
+
+@dp.pre_checkout_query()
+async def precheckout(query: PreCheckoutQuery):
+    await bot.answer_pre_checkout_query(query.id, ok=True)
+
+@dp.message(F.successful_payment)
+async def successful_payment(message: types.Message):
+    user_id = message.from_user.id
+    expires_at = datetime.now(timezone.utc) + timedelta(days=30)
+    with sqlite3.connect('vpn_keys.db') as conn:
+        conn.execute('''
+            UPDATE users SET expires_at = ? WHERE user_id = ?
+        ''', (expires_at.isoformat(), user_id))
+        conn.commit()
+    await message.answer("✅ Подписка успешно активирована!")
+
+# ================= РЕФЕРАЛЬНАЯ СИСТЕМА =================
+
+@dp.message(Command("ref"))
+async def referral_system(message: types.Message):
+    ref_link = f"https://t.me/@VPNbot11_bot?start=refdanigoncharov2011"
+    await message.answer(
         f"🎁 Пригласите друзей и получайте +{REFERRAL_BONUS_DAYS} дней за каждого!\n\n"
         f"Ваша ссылка:\n{ref_link}"
     )
 
-async def device_management(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Управление устройствами"""
-    # Логика проверки активных подключений
-    await update.message.reply_text(
-        "📱 Активные устройства:\n"
-        "1. Android [IP: 192.168.1.101]\n"
-        "2. Windows [IP: 192.168.1.102]\n\n"
-        "❌ Для отключения используйте /revoke <номер>"
-    )
+async def process_referral(referrer_id: int, referral_id: int):
+    with sqlite3.connect('vpn_keys.db') as conn:
+        conn.execute('''
+            UPDATE users SET expires_at = datetime(expires_at, '+' || ? || ' days')
+            WHERE user_id = ?
+        ''', (REFERRAL_BONUS_DAYS, referrer_id))
+        conn.execute('''
+            INSERT OR IGNORE INTO referrals (referrer_id, referral_id)
+            VALUES (?, ?)
+        ''', (referrer_id, referral_id))
+        conn.commit()
 
-async def server_selection(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Выбор сервера"""
-    keyboard = InlineKeyboardMarkup([
-        [InlineKeyboardButton("🇷🇺 Москва", callback_data="server_ru")],
-        [InlineKeyboardButton("🇩🇪 Берлин", callback_data="server_de")],
-        [InlineKeyboardButton("🇺🇸 Нью-Йорк", callback_data="server_us")]
-    ])
+# ================= УПРАВЛЕНИЕ УСТРОЙСТВАМИ =================
+
+@dp.message(Command("devices"))
+async def device_management(message: types.Message):
+    with sqlite3.connect('vpn_keys.db') as conn:
+        cursor = conn.cursor()
+        cursor.execute('''
+            SELECT device_info FROM devices 
+            WHERE user_id = ? 
+            ORDER BY created_at DESC LIMIT ?
+        ''', (message.from_user.id, MAX_DEVICES))
+        devices = cursor.fetchall()
     
-    await update.message.reply_text(
-        "🌍 Выберите сервер:",
-        reply_markup=keyboard
-    )
+    response = "📱 Активные устройства:\n"
+    for idx, (device,) in enumerate(devices, 1):
+        response += f"{idx}. {device}\n"
+    response += "\n❌ Для отключения используйте /revoke <номер>"
+    await message.answer(response)
 
-# ==================  PAYMENT  ================== #
+# ================= ВЫБОР СЕРВЕРА =================
+@dp.message(Command("servers"))
+async def server_selection(message: types.Message):
+    builder = InlineKeyboardBuilder()
+    builder.button(text="🇷🇺 Москва", callback_data="server_ru")
+    builder.button(text="🇩🇪 Берлин", callback_data="server_de")
+    builder.button(text="🇺🇸 Нью-Йорк", callback_data="server_us")
+    await message.answer("🌍 Выберите сервер:", reply_markup=builder.as_markup())
 
-async def buy(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Меню выбора способа оплаты"""
-    keyboard = InlineKeyboardMarkup([
-        [InlineKeyboardButton("💳 Оплата картой", callback_data="pay_card")],
-        [InlineKeyboardButton("⭐️ Telegram Stars", callback_data="pay_stars")]
-    ])
-    
-    await update.message.reply_text(
-        "🎁 Выберите способ оплаты:",
-        reply_markup=keyboard
-    )
+@dp.callback_query(F.data.startswith("server_"))
+async def handle_server_selection(callback: types.CallbackQuery):
+    server = callback.data.split("_")[1]
+    await callback.message.edit_text(f"✅ Выбран сервер: {server.upper()}")
+    await callback.answer()
 
-async def handle_payment_choice(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Обработчик выбора оплаты"""
-    query = update.callback_query
-    await query.answer()
-    
-    if query.data == "pay_card":
-        await send_card_invoice(query)
-    elif query.data == "pay_stars":
-        await send_stars_invoice(query)
+# ================= ЗАПУСК И ПЛАНИРОВЩИК =================
+async def check_subscriptions():
+    with sqlite3.connect('vpn_keys.db') as conn:
+        cursor = conn.cursor()
+        cursor.execute('''
+            SELECT user_id FROM users 
+            WHERE expires_at < ?
+        ''', (datetime.now(timezone.utc).isoformat(),))
+        for (user_id,) in cursor.fetchall():
+            await bot.send_message(
+                user_id,
+                "⚠️ Ваша подписка истекает через 3 дня! Продлите её командой /buy"
+            )
 
-async def send_card_invoice(query):
-    """Инвойс для оплаты картой"""
-    await query.message.reply_invoice(
-        title="VPN Premium (Карта)",
-        description="Доступ к VPN на 1 месяц",
-        payload="card_payment",
-        provider_token="YOUR_CARD_PROVIDER_TOKEN",  # Токен для карт
-        currency="RUB",
-        prices=[LabeledPrice("Месячная подписка", 49000)],
-        need_phone_number=False,
-        need_email=False
-    )
-
-async def send_stars_invoice(query):
-    """Инвойс для оплаты Stars"""
-    await query.message.reply_invoice(
-        title="VPN Premium (Stars)",
-        description="Доступ к VPN на 1 месяц",
-        payload="stars_payment",
-        provider_token="YOUR_STARS_PROVIDER_TOKEN",  # Токен для Stars
-        currency="XTR",
-        prices=[LabeledPrice("Месячная подписка", 50 * 100)],  # 50 Stars
-        need_phone_number=False,
-        need_email=False
-    )
-
-async def precheckout(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Подтверждение платежа"""
-    query = update.pre_checkout_query
-    await query.answer(ok=True)
-
-async def successful_payment(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Обработка успешного платежа"""
-    user_id = update.effective_user.id
-    payment = update.message.successful_payment
-    
-    # Обновляем срок подписки
-    expires_at = datetime.now(timezone.utc) + timedelta(days=30)
-    
-    conn = sqlite3.connect('vpn_keys.db')
-    cursor = conn.cursor()
-    cursor.execute('''
-        UPDATE users 
-        SET expires_at = ? 
-        WHERE user_id = ?
-    ''', (expires_at.isoformat(), user_id))
-    conn.commit()
-    conn.close()
-    
-    await update.message.reply_text("✅ Подписка успешно активирована!")
-
-# ================= ЗАПУСК БОТА ================= #
-
-async def check_subscriptions(app: Application):
-    """Ежедневная проверка подписок"""
-    try:
-        with sqlite3.connect('vpn_keys.db') as conn:
-            cursor = conn.cursor()
-            cursor.execute("SELECT user_id FROM users WHERE expires_at < ?", 
-                         (datetime.now(timezone.utc).isoformat(),))
-            
-            for user_id, in cursor.fetchall():
-                await app.bot.send_message(
-                    user_id,
-                    "⚠️ Ваша подписка истекает через 3 дня! Продлите её командой /buy"
-                )
-    except Exception as e:
-        logger.error(f"Subscription check error: {e}")
-
-async def main() -> None:
-    application = Application.builder().token(TOKEN).build()
-
-    # Планировщик задач
-    scheduler = AsyncIOScheduler()
+async def main():
     scheduler.add_job(
         check_subscriptions,
-        IntervalTrigger(days=1),
-        args=[application]
+        IntervalTrigger(days=1)
     )
     scheduler.start()
-
-    # Регистрация обработчиков
-    handlers = [
-        CommandHandler("start", start),
-        CommandHandler("getkey", getkey),
-        CommandHandler("dns", dns),
-        CommandHandler("support", support),
-        CommandHandler("stats", stats),
-        CommandHandler("allkeys", allkeys),
-        CommandHandler("myid", myid),
-        CommandHandler("buy", buy),
-        CommandHandler("ref", referral_system),
-        CommandHandler("devices", device_management),
-        CommandHandler("servers", server_selection),
-        CallbackQueryHandler(button_handler),
-        CallbackQueryHandler(handle_payment_choice, pattern=r"^(pay_card|pay_stars)$"),
-        PreCheckoutQueryHandler(precheckout),
-        MessageHandler(filters.SUCCESSFUL_PAYMENT, successful_payment),
-        MessageHandler(filters.TEXT & ~filters.COMMAND, start)
-    ]
-
-    for handler in handlers:
-        application.add_handler(handler)
-
-    await application.run_polling()
+    await dp.start_polling(bot)
 
 if __name__ == "__main__":
     asyncio.run(main())
